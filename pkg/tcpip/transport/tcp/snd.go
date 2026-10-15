@@ -343,6 +343,17 @@ func (s *sender) initCongestionControl(congestionControlName tcpip.CongestionCon
 	switch congestionControlName {
 	case ccCubic:
 		return newCubicCC(s)
+	case ccCubicWestwood:
+		c := newCubicCC(s)
+		c.westwood = true
+		return c
+	case ccCubicLossDiff:
+		c := newCubicCC(s)
+		c.lossDiff = true
+		c.roundEnd = s.SndNxt
+		c.lossSndNxt = s.SndNxt
+		c.lossRtx = s.ep.stats.SendErrors.Retransmits.Value()
+		return c
 	case ccReno:
 		fallthrough
 	default:

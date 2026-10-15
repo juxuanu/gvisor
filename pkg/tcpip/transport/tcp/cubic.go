@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 )
 
 // effectivelyInfinity is an initialization value used for round-trip times
@@ -64,6 +65,179 @@ type cubicState struct {
 	numCongestionEvents int
 
 	s *sender
+
+	// westwood enables a Westwood+ loss response: on loss, ssthresh is set
+	// to the estimated bandwidth-delay product instead of always being cut
+	// by beta. Random losses on an uncongested path then barely shrink the
+	// window, while real congestion, which inflates the RTT above its
+	// minimum, still reduces it (never by more than beta).
+	westwood bool `state:"nosave"`
+
+	// bwe is the low-pass filtered delivery rate in bytes per second.
+	bwe float64 `state:"nosave"`
+
+	// minRTT is the smallest RTT sample seen.
+	minRTT time.Duration `state:"nosave"`
+
+	// lastRTT is the most recent RTT sample.
+	lastRTT time.Duration `state:"nosave"`
+
+	// sampleStart and sampleBytes accumulate ACKed bytes for the current
+	// bandwidth sample. A zero sampleStart starts a new sample.
+	sampleStart tcpip.MonotonicTime `state:"nosave"`
+	sampleBytes int                 `state:"nosave"`
+
+	// lossDiff enables loss differentiation: a loss while the RTT is close
+	// to its minimum, i.e. without a standing queue, is treated as random
+	// (e.g. radio loss) and doesn't reduce the window or restart the cubic
+	// epoch. Losses with a standing queue get the regular CUBIC response.
+	lossDiff bool `state:"nosave"`
+
+	// roundEnd is SND.NXT when the current round trip began.
+	// roundMinRTT and prevRoundMinRTT are the smallest RTT samples of the
+	// current and previous round trips; zero means no sample.
+	roundEnd        seqnum.Value  `state:"nosave"`
+	roundMinRTT     time.Duration `state:"nosave"`
+	prevRoundMinRTT time.Duration `state:"nosave"`
+
+	// randomEpisode is set while recovering from a loss classified as
+	// random. resumeSlowStart is set if that loss interrupted slow start.
+	randomEpisode   bool `state:"nosave"`
+	resumeSlowStart bool `state:"nosave"`
+
+	// lossRounds holds per-round loss accounting for the last round trips,
+	// lossNext is the next slot to fill, and lossSndNxt and lossRtx are
+	// SND.NXT and the retransmission count when the current round began.
+	lossRounds [8]lossRound `state:"nosave"`
+	lossNext   int          `state:"nosave"`
+	lossSndNxt seqnum.Value `state:"nosave"`
+	lossRtx    uint64       `state:"nosave"`
+}
+
+// trackRTT updates the minimum and per-round RTTs with a sample.
+//
+// +checklocks:c.s.ep.mu
+func (c *cubicState) trackRTT(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	c.lastRTT = rtt
+	if c.minRTT == 0 || rtt < c.minRTT {
+		c.minRTT = rtt
+	}
+	if c.roundMinRTT == 0 || rtt < c.roundMinRTT {
+		c.roundMinRTT = rtt
+	}
+	if c.roundEnd.LessThan(c.s.SndUna) {
+		c.prevRoundMinRTT = c.roundMinRTT
+		c.roundMinRTT = 0
+		c.roundEnd = c.s.SndNxt
+		if c.lossDiff {
+			c.recordRound()
+		}
+	}
+}
+
+// randomLoss reports whether a loss now looks random rather than caused by
+// congestion: the smallest RTT over the last round trips is within a small
+// margin of the path's minimum, so no queue is standing at a bottleneck.
+//
+// +checklocks:c.s.ep.mu
+func (c *cubicState) randomLoss() bool {
+	recent := c.roundMinRTT
+	if c.prevRoundMinRTT != 0 && (recent == 0 || c.prevRoundMinRTT < recent) {
+		recent = c.prevRoundMinRTT
+	}
+	if c.minRTT == 0 || recent == 0 {
+		return false
+	}
+	margin := min(max(c.minRTT/4, 4*time.Millisecond), 20*time.Millisecond)
+	if recent-c.minRTT >= margin {
+		return false
+	}
+	// A shallow bottleneck queue drops packets before it adds much delay.
+	// Random loss stays at the path's loss rate, while ignoring congestion
+	// drives the loss rate up, so give up on that once it's too high.
+	return c.recentLossRate() < lossDiffMaxLossRate
+}
+
+// lossDiffMaxLossRate is the recent retransmission rate above which losses
+// are always treated as congestion.
+const lossDiffMaxLossRate = 0.03
+
+// lossRound counts the data sent and retransmitted in one round trip.
+type lossRound struct {
+	sentBytes int
+	rtxPkts   uint64
+}
+
+// recordRound closes the per-round loss accounting at a round boundary.
+//
+// +checklocks:c.s.ep.mu
+func (c *cubicState) recordRound() {
+	rtx := c.s.ep.stats.SendErrors.Retransmits.Value()
+	c.lossRounds[c.lossNext] = lossRound{
+		sentBytes: int(c.lossSndNxt.Size(c.s.SndNxt)),
+		rtxPkts:   rtx - c.lossRtx,
+	}
+	c.lossNext = (c.lossNext + 1) % len(c.lossRounds)
+	c.lossSndNxt = c.s.SndNxt
+	c.lossRtx = rtx
+}
+
+// recentLossRate returns retransmitted over newly sent data, in packets, over
+// the last few round trips including the current one.
+//
+// +checklocks:c.s.ep.mu
+func (c *cubicState) recentLossRate() float64 {
+	sent := int(c.lossSndNxt.Size(c.s.SndNxt))
+	rtx := c.s.ep.stats.SendErrors.Retransmits.Value() - c.lossRtx
+	for _, r := range c.lossRounds {
+		sent += r.sentBytes
+		rtx += r.rtxPkts
+	}
+	pkts := float64(sent) / float64(c.s.MaxPayloadSize)
+	if pkts < 1 {
+		return 0
+	}
+	return float64(rtx) / pkts
+}
+
+// westwoodMinSample is the minimum bandwidth sample interval, as in Linux's
+// tcp_westwood (TCP_WESTWOOD_RTT_MIN).
+const westwoodMinSample = 50 * time.Millisecond
+
+// updateBandwidthEstimate accounts packetsAcked to the delivery rate estimate,
+// closing a sample at least every RTT (Westwood+).
+//
+// +checklocks:c.s.ep.mu
+func (c *cubicState) updateBandwidthEstimate(packetsAcked int, ackTime tcpip.MonotonicTime) {
+	if c.sampleStart == (tcpip.MonotonicTime{}) {
+		c.sampleStart = ackTime
+		c.sampleBytes = 0
+	}
+	c.sampleBytes += packetsAcked * c.s.MaxPayloadSize
+	d := ackTime.Sub(c.sampleStart)
+	if d < max(c.lastRTT, westwoodMinSample) {
+		return
+	}
+	sample := float64(c.sampleBytes) / d.Seconds()
+	if c.bwe == 0 {
+		c.bwe = sample
+	} else {
+		c.bwe = (7*c.bwe + sample) / 8
+	}
+	c.sampleStart = ackTime
+	c.sampleBytes = 0
+}
+
+// bdpPackets returns the estimated bandwidth-delay product in packets, or 0
+// if there is no estimate yet.
+func (c *cubicState) bdpPackets() int {
+	if c.bwe == 0 || c.minRTT == 0 {
+		return 0
+	}
+	return int(c.bwe * c.minRTT.Seconds() / float64(c.s.MaxPayloadSize))
 }
 
 // newCubicCC returns a partially initialized cubic state with the constants
@@ -211,6 +385,12 @@ func (c *cubicState) updateSlowStart(packetsAcked int) int {
 // +checklocks:c.s.ep.mu
 // +checklocksexclude:c.s.rtt.rttMutex
 func (c *cubicState) Update(packetsAcked int, rtt time.Duration, ackTime tcpip.MonotonicTime) {
+	if c.westwood || c.lossDiff {
+		c.trackRTT(rtt)
+	}
+	if c.westwood {
+		c.updateBandwidthEstimate(packetsAcked, ackTime)
+	}
 	if c.s.Ssthresh == InitialSsthresh && c.s.SndCwnd < c.s.Ssthresh {
 		c.updateHyStart(rtt, ackTime)
 	}
@@ -278,6 +458,17 @@ func (c *cubicState) getCwnd(packetsAcked, sndCwnd int, srtt time.Duration) int 
 //
 // +checklocks:c.s.ep.mu
 func (c *cubicState) HandleLossDetected() {
+	if c.lossDiff && c.randomLoss() {
+		// Retransmit without reducing the window or restarting the
+		// cubic epoch. The sender derives cwnd from ssthresh during and
+		// after recovery, so pin ssthresh to cwnd until PostRecovery.
+		c.randomEpisode = true
+		if c.s.Ssthresh == InitialSsthresh {
+			c.resumeSlowStart = true
+		}
+		c.s.Ssthresh = c.s.SndCwnd
+		return
+	}
 	// See: https://tools.ietf.org/html/rfc8312#section-4.5
 	c.numCongestionEvents++
 	c.T = c.s.ep.stack.Clock().NowMonotonic()
@@ -324,13 +515,38 @@ func (c *cubicState) fastConvergence() {
 
 // PostRecovery implements congestionControl.PostRecovery.
 func (c *cubicState) PostRecovery() {
+	// Update isn't called during recovery, so the open bandwidth sample
+	// would span the recovery with few bytes; start a new one.
+	c.sampleStart = tcpip.MonotonicTime{}
+	if c.randomEpisode {
+		c.randomEpisode = false
+		if c.resumeSlowStart {
+			c.resumeSlowStart = false
+			c.s.Ssthresh = InitialSsthresh
+		}
+		return
+	}
 	c.T = c.s.ep.stack.Clock().NowMonotonic()
 }
 
 // reduceSlowStartThreshold returns new SsThresh as described in
 // https://tools.ietf.org/html/rfc8312#section-4.7.
 //
+// With westwood, ssthresh is instead the estimated bandwidth-delay product,
+// bounded below by the beta reduction and above by cwnd, and the cubic curve
+// is re-anchored to start from it.
+//
 // +checklocks:c.s.ep.mu
 func (c *cubicState) reduceSlowStartThreshold() {
-	c.s.Ssthresh = int(math.Max(float64(c.s.SndCwnd)*c.Beta, 2.0))
+	ssthresh := float64(c.s.SndCwnd) * c.Beta
+	if c.westwood {
+		c.sampleStart = tcpip.MonotonicTime{}
+		if bdp := float64(c.bdpPackets()); bdp > ssthresh {
+			ssthresh = math.Min(bdp, float64(c.s.SndCwnd))
+		}
+		// Grow back from ssthresh rather than from beta * WMax.
+		c.WMax = math.Max(c.WMax, ssthresh)
+		c.K = math.Cbrt((c.WMax - ssthresh) / c.C)
+	}
+	c.s.Ssthresh = int(math.Max(ssthresh, 2.0))
 }
