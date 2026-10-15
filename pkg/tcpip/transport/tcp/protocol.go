@@ -83,7 +83,6 @@ const (
 const (
 	ccReno          = "reno"
 	ccCubic         = "cubic"
-	ccCubicWestwood = "cubic-westwood"
 	ccCubicLossDiff = "cubic-lossdiff"
 )
 
@@ -611,7 +610,7 @@ func newProtocol(s *stack.Stack, cc string, probe TCPProbeFunc) stack.TransportP
 		},
 		sackEnabled:                true,
 		congestionControl:          cc,
-		availableCongestionControl: []string{ccReno, ccCubic, ccCubicWestwood, ccCubicLossDiff},
+		availableCongestionControl: []string{ccReno, ccCubic, ccCubicLossDiff},
 		moderateReceiveBuffer:      true,
 		lingerTimeout:              DefaultTCPLingerTimeout,
 		timeWaitTimeout:            DefaultTCPTimeWaitTimeout,

@@ -66,26 +66,8 @@ type cubicState struct {
 
 	s *sender
 
-	// westwood enables a Westwood+ loss response: on loss, ssthresh is set
-	// to the estimated bandwidth-delay product instead of always being cut
-	// by beta. Random losses on an uncongested path then barely shrink the
-	// window, while real congestion, which inflates the RTT above its
-	// minimum, still reduces it (never by more than beta).
-	westwood bool `state:"nosave"`
-
-	// bwe is the low-pass filtered delivery rate in bytes per second.
-	bwe float64 `state:"nosave"`
-
 	// minRTT is the smallest RTT sample seen.
 	minRTT time.Duration `state:"nosave"`
-
-	// lastRTT is the most recent RTT sample.
-	lastRTT time.Duration `state:"nosave"`
-
-	// sampleStart and sampleBytes accumulate ACKed bytes for the current
-	// bandwidth sample. A zero sampleStart starts a new sample.
-	sampleStart tcpip.MonotonicTime `state:"nosave"`
-	sampleBytes int                 `state:"nosave"`
 
 	// lossDiff enables loss differentiation: a loss while the RTT is close
 	// to its minimum, i.e. without a standing queue, is treated as random
@@ -123,7 +105,6 @@ func (c *cubicState) trackRTT(rtt time.Duration) {
 	if rtt <= 0 {
 		return
 	}
-	c.lastRTT = rtt
 	if c.minRTT == 0 || rtt < c.minRTT {
 		c.minRTT = rtt
 	}
@@ -230,43 +211,6 @@ func (c *cubicState) recentLossRate() float64 {
 		return 0
 	}
 	return float64(rtx) / pkts
-}
-
-// westwoodMinSample is the minimum bandwidth sample interval, as in Linux's
-// tcp_westwood (TCP_WESTWOOD_RTT_MIN).
-const westwoodMinSample = 50 * time.Millisecond
-
-// updateBandwidthEstimate accounts packetsAcked to the delivery rate estimate,
-// closing a sample at least every RTT (Westwood+).
-//
-// +checklocks:c.s.ep.mu
-func (c *cubicState) updateBandwidthEstimate(packetsAcked int, ackTime tcpip.MonotonicTime) {
-	if c.sampleStart == (tcpip.MonotonicTime{}) {
-		c.sampleStart = ackTime
-		c.sampleBytes = 0
-	}
-	c.sampleBytes += packetsAcked * c.s.MaxPayloadSize
-	d := ackTime.Sub(c.sampleStart)
-	if d < max(c.lastRTT, westwoodMinSample) {
-		return
-	}
-	sample := float64(c.sampleBytes) / d.Seconds()
-	if c.bwe == 0 {
-		c.bwe = sample
-	} else {
-		c.bwe = (7*c.bwe + sample) / 8
-	}
-	c.sampleStart = ackTime
-	c.sampleBytes = 0
-}
-
-// bdpPackets returns the estimated bandwidth-delay product in packets, or 0
-// if there is no estimate yet.
-func (c *cubicState) bdpPackets() int {
-	if c.bwe == 0 || c.minRTT == 0 {
-		return 0
-	}
-	return int(c.bwe * c.minRTT.Seconds() / float64(c.s.MaxPayloadSize))
 }
 
 // newCubicCC returns a partially initialized cubic state with the constants
@@ -414,11 +358,8 @@ func (c *cubicState) updateSlowStart(packetsAcked int) int {
 // +checklocks:c.s.ep.mu
 // +checklocksexclude:c.s.rtt.rttMutex
 func (c *cubicState) Update(packetsAcked int, rtt time.Duration, ackTime tcpip.MonotonicTime) {
-	if c.westwood || c.lossDiff {
+	if c.lossDiff {
 		c.trackRTT(rtt)
-	}
-	if c.westwood {
-		c.updateBandwidthEstimate(packetsAcked, ackTime)
 	}
 	if c.s.Ssthresh == InitialSsthresh && c.s.SndCwnd < c.s.Ssthresh {
 		c.updateHyStart(rtt, ackTime)
@@ -544,9 +485,6 @@ func (c *cubicState) fastConvergence() {
 
 // PostRecovery implements congestionControl.PostRecovery.
 func (c *cubicState) PostRecovery() {
-	// Update isn't called during recovery, so the open bandwidth sample
-	// would span the recovery with few bytes; start a new one.
-	c.sampleStart = tcpip.MonotonicTime{}
 	if c.randomEpisode {
 		c.randomEpisode = false
 		if c.resumeSlowStart {
@@ -579,21 +517,7 @@ func (c *cubicState) restoreUndoState(v any) {
 // reduceSlowStartThreshold returns new SsThresh as described in
 // https://tools.ietf.org/html/rfc8312#section-4.7.
 //
-// With westwood, ssthresh is instead the estimated bandwidth-delay product,
-// bounded below by the beta reduction and above by cwnd, and the cubic curve
-// is re-anchored to start from it.
-//
 // +checklocks:c.s.ep.mu
 func (c *cubicState) reduceSlowStartThreshold() {
-	ssthresh := float64(c.s.SndCwnd) * c.Beta
-	if c.westwood {
-		c.sampleStart = tcpip.MonotonicTime{}
-		if bdp := float64(c.bdpPackets()); bdp > ssthresh {
-			ssthresh = math.Min(bdp, float64(c.s.SndCwnd))
-		}
-		// Grow back from ssthresh rather than from beta * WMax.
-		c.WMax = math.Max(c.WMax, ssthresh)
-		c.K = math.Cbrt((c.WMax - ssthresh) / c.C)
-	}
-	c.s.Ssthresh = int(math.Max(ssthresh, 2.0))
+	c.s.Ssthresh = int(math.Max(float64(c.s.SndCwnd)*c.Beta, 2.0))
 }

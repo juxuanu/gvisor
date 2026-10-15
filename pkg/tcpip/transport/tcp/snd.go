@@ -347,10 +347,6 @@ func (s *sender) initCongestionControl(congestionControlName tcpip.CongestionCon
 	switch congestionControlName {
 	case ccCubic:
 		return newCubicCC(s)
-	case ccCubicWestwood:
-		c := newCubicCC(s)
-		c.westwood = true
-		return c
 	case ccCubicLossDiff:
 		c := newCubicCC(s)
 		c.lossDiff = true
