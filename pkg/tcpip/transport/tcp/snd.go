@@ -190,6 +190,10 @@ type sender struct {
 	// corkTimer is used to drain the segments which are held when TCP_CORK
 	// option is enabled.
 	corkTimer timer `state:"nosave"`
+
+	// undo holds the congestion state saved before the last loss response,
+	// restored if the loss proves spurious.
+	undo congestionUndo `state:"nosave"`
 }
 
 // protectedWriteList wraps the write list, checking for invalid state when
@@ -642,6 +646,7 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	// https://datatracker.ietf.org/doc/html/rfc3522#section-3.2 Step 2
 	s.recordRetransmitTS()
 
+	s.beginUndoEpisode(true /* rto */)
 	s.state = tcpip.RTORecovery
 	s.cc.HandleRTOExpired()
 
@@ -1320,7 +1325,7 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 		s.DupAckCount = 0
 		return false
 	}
-	s.cc.HandleLossDetected()
+	s.handleLossDetected()
 	s.enterRecovery()
 	return true
 }
@@ -1603,6 +1608,10 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			hasDSACK = s.walkSACK(rcvdSeg)
 		}
 		s.SetPipe()
+
+		// Undo the last window reduction if this DSACK completes the proof
+		// that all of its retransmissions were unnecessary.
+		s.checkUndoOnDSACK(rcvdSeg)
 	}
 
 	ack := rcvdSeg.ackNumber
@@ -1737,6 +1746,10 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			s.detectSpuriousRecovery(hasDSACK, rcvdSeg.parsedOptions.TSEcr)
 		}
 
+		// Undo the last window reduction if this ACK shows the original
+		// transmission arrived.
+		s.checkUndoOnAck(rcvdSeg)
+
 		// If we are not in fast recovery then update the congestion
 		// window based on the number of acknowledged packets.
 		if !s.FastRecovery.Active {
@@ -1790,7 +1803,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			// If any segment is marked as lost by
 			// RACK, enter recovery and retransmit
 			// the lost segments.
-			s.cc.HandleLossDetected()
+			s.handleLossDetected()
 			s.enterRecovery()
 			fastRetransmit = true
 		}
@@ -1828,6 +1841,7 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 		if s.SndCwnd < s.Ssthresh {
 			s.ep.stack.Stats().TCP.SlowStartRetransmits.Increment()
 		}
+		s.noteRetransmit(seg)
 	}
 	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
 	seg.xmitCount++
