@@ -1799,7 +1799,13 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		// After the reorder window is calculated, detect any loss by checking
 		// if the time elapsed after the segments are sent is greater than the
 		// reorder window.
-		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active {
+		// During RTO recovery the go-back-N retransmission already resends
+		// everything unSACKed. Entering SACK recovery there would recompute
+		// the pipe from a scoreboard the RTO reset, counting most of the
+		// flight as outstanding against the collapsed cwnd and stalling the
+		// sender until the next RTO, repeatedly. Like Linux's CA_Loss
+		// state, stay in RTO recovery until it completes.
+		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active && s.state != tcpip.RTORecovery {
 			// If any segment is marked as lost by
 			// RACK, enter recovery and retransmit
 			// the lost segments.
