@@ -299,6 +299,23 @@ func (s *SACKScoreboard) MaxSACKED() seqnum.Value {
 	return s.maxSACKED
 }
 
+// LargestHole returns the size of the largest unSACKed range between from and
+// the highest SACKed sequence number.
+func (s *SACKScoreboard) LargestHole(from seqnum.Value) seqnum.Size {
+	var largest seqnum.Size
+	prev := from
+	s.ranges.Ascend(func(sb header.SACKBlock) bool {
+		if prev.LessThan(sb.Start) {
+			largest = max(largest, prev.Size(sb.Start))
+		}
+		if prev.LessThan(sb.End) {
+			prev = sb.End
+		}
+		return true
+	})
+	return largest
+}
+
 // SMSS returns the sender's MSS as held by the SACK scoreboard.
 func (s *SACKScoreboard) SMSS() uint16 {
 	return s.smss

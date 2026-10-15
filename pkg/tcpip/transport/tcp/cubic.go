@@ -140,7 +140,9 @@ func (c *cubicState) trackRTT(rtt time.Duration) {
 
 // randomLoss reports whether a loss now looks random rather than caused by
 // congestion: the smallest RTT of the current round trip is within a small
-// margin of the path's minimum, so no queue is standing at a bottleneck.
+// margin of the path's minimum, so no queue is standing at a bottleneck; the
+// receiver is missing no long runs of packets; and the recent loss rate is
+// low.
 //
 // +checklocks:c.s.ep.mu
 func (c *cubicState) randomLoss() bool {
@@ -157,15 +159,27 @@ func (c *cubicState) randomLoss() bool {
 	if recent-c.minRTT >= margin {
 		return false
 	}
+	// Random loss leaves isolated holes in what the receiver has, while a
+	// queue overflowing under a burst (netstack doesn't pace) drops runs of
+	// consecutive packets, even at a shallow queue that adds little delay.
+	if c.s.ep.SACKPermitted && int(c.s.ep.scoreboard.LargestHole(c.s.SndUna)) > lossDiffMaxHole*c.s.MaxPayloadSize {
+		return false
+	}
 	// A shallow bottleneck queue drops packets before it adds much delay.
 	// Random loss stays at the path's loss rate, while ignoring congestion
 	// drives the loss rate up, so give up on that once it's too high.
 	return c.recentLossRate() < lossDiffMaxLossRate
 }
 
-// lossDiffMaxLossRate is the recent retransmission rate above which losses
-// are always treated as congestion.
-const lossDiffMaxLossRate = 0.03
+const (
+	// lossDiffMaxLossRate is the recent retransmission rate above which
+	// losses are always treated as congestion.
+	lossDiffMaxLossRate = 0.03
+
+	// lossDiffMaxHole is the largest run of consecutive missing packets,
+	// as reported by SACK, that still counts as random loss.
+	lossDiffMaxHole = 2
+)
 
 // lossRound counts the data sent and retransmitted in one round trip.
 type lossRound struct {
