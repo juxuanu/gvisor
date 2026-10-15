@@ -139,13 +139,15 @@ func (c *cubicState) trackRTT(rtt time.Duration) {
 }
 
 // randomLoss reports whether a loss now looks random rather than caused by
-// congestion: the smallest RTT over the last round trips is within a small
+// congestion: the smallest RTT of the current round trip is within a small
 // margin of the path's minimum, so no queue is standing at a bottleneck.
 //
 // +checklocks:c.s.ep.mu
 func (c *cubicState) randomLoss() bool {
+	// Prefer the current round: during slow start a queue fills within a
+	// round trip, and the previous round's minimum lags behind it.
 	recent := c.roundMinRTT
-	if c.prevRoundMinRTT != 0 && (recent == 0 || c.prevRoundMinRTT < recent) {
+	if recent == 0 {
 		recent = c.prevRoundMinRTT
 	}
 	if c.minRTT == 0 || recent == 0 {

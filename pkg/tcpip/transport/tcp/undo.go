@@ -173,7 +173,6 @@ func (s *sender) undoCongestionReduction() {
 	}
 	s.ep.stack.Stats().TCP.SpuriousRecoveryUndo.Increment()
 
-	wasRTO := s.state == tcpip.RTORecovery
 	if s.FastRecovery.Active {
 		s.leaveRecovery()
 	}
@@ -183,10 +182,13 @@ func (s *sender) undoCongestionReduction() {
 		s.cc.(undoableCC).restoreUndoState(u.cc)
 	}
 
-	if wasRTO {
-		// The RTO rewound writeNext to SND.UNA and zeroed Outstanding to
-		// retransmit everything in flight. That data was not lost, so resume
-		// with never-sent data and count the rest as outstanding again.
+	if wn := s.writeNext; wn != nil && s.isAssignedSequenceNumber(wn) && wn.sequenceNumber.LessThan(s.SndNxt) {
+		// An RTO rewound writeNext to SND.UNA and zeroed Outstanding to
+		// retransmit everything in flight (go-back-N). That data was not
+		// lost, so resume with never-sent data and count the unSACKed rest
+		// as outstanding again. Check the rewind itself rather than the
+		// RTORecovery state: a later ACK may have moved the sender into
+		// SACK recovery since.
 		s.Outstanding = 0
 		var next *segment
 		for seg := s.writeList.Front(); seg != nil; seg = seg.Next() {
@@ -194,7 +196,9 @@ func (s *sender) undoCongestionReduction() {
 				next = seg
 				break
 			}
-			s.Outstanding += s.pCount(seg, s.MaxPayloadSize)
+			if !s.ep.SACKPermitted || !s.ep.scoreboard.IsSACKED(seg.sackBlock()) {
+				s.Outstanding += s.pCount(seg, s.MaxPayloadSize)
+			}
 		}
 		s.updateWriteNext(next)
 	}
