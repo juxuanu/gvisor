@@ -327,6 +327,24 @@ func (c *cubicState) PostRecovery() {
 	c.T = c.s.ep.stack.Clock().NowMonotonic()
 }
 
+// cubicUndo is a snapshot of cubic's state for undoableCC.
+type cubicUndo struct {
+	state               TCPCubicState
+	numCongestionEvents int
+}
+
+// undoState implements undoableCC.undoState.
+func (c *cubicState) undoState() any {
+	return cubicUndo{state: c.TCPCubicState, numCongestionEvents: c.numCongestionEvents}
+}
+
+// restoreUndoState implements undoableCC.restoreUndoState.
+func (c *cubicState) restoreUndoState(v any) {
+	u := v.(cubicUndo)
+	c.TCPCubicState = u.state
+	c.numCongestionEvents = u.numCongestionEvents
+}
+
 // reduceSlowStartThreshold returns new SsThresh as described in
 // https://tools.ietf.org/html/rfc8312#section-4.7.
 //
