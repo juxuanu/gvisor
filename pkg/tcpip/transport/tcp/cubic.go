@@ -93,12 +93,14 @@ type cubicState struct {
 	// epoch. Losses with a standing queue get the regular CUBIC response.
 	lossDiff bool `state:"nosave"`
 
-	// roundEnd is SND.NXT when the current round trip began.
-	// roundMinRTT and prevRoundMinRTT are the smallest RTT samples of the
-	// current and previous round trips; zero means no sample.
-	roundEnd        seqnum.Value  `state:"nosave"`
-	roundMinRTT     time.Duration `state:"nosave"`
-	prevRoundMinRTT time.Duration `state:"nosave"`
+	// roundEnd is SND.NXT when the current round trip began. roundMinRTT
+	// is the smallest RTT sample of the current round trip, and roundMins
+	// those of the previous ones, with roundMinsNext the next slot to fill;
+	// zero means no sample.
+	roundEnd      seqnum.Value                      `state:"nosave"`
+	roundMinRTT   time.Duration                     `state:"nosave"`
+	roundMins     [lossDiffRounds - 1]time.Duration `state:"nosave"`
+	roundMinsNext int                               `state:"nosave"`
 
 	// randomEpisode is set while recovering from a loss classified as
 	// random. resumeSlowStart is set if that loss interrupted slow start.
@@ -129,7 +131,8 @@ func (c *cubicState) trackRTT(rtt time.Duration) {
 		c.roundMinRTT = rtt
 	}
 	if c.roundEnd.LessThan(c.s.SndUna) {
-		c.prevRoundMinRTT = c.roundMinRTT
+		c.roundMins[c.roundMinsNext] = c.roundMinRTT
+		c.roundMinsNext = (c.roundMinsNext + 1) % len(c.roundMins)
 		c.roundMinRTT = 0
 		c.roundEnd = c.s.SndNxt
 		if c.lossDiff {
@@ -139,18 +142,20 @@ func (c *cubicState) trackRTT(rtt time.Duration) {
 }
 
 // randomLoss reports whether a loss now looks random rather than caused by
-// congestion: the smallest RTT of the current round trip is within a small
-// margin of the path's minimum, so no queue is standing at a bottleneck; the
-// receiver is missing no long runs of packets; and the recent loss rate is
-// low.
+// congestion: the smallest RTT over the last few round trips is within a
+// small margin of the path's minimum, so no queue is standing at a
+// bottleneck; the receiver is missing no long runs of packets; and the recent
+// loss rate is low.
 //
 // +checklocks:c.s.ep.mu
 func (c *cubicState) randomLoss() bool {
-	// Prefer the current round: during slow start a queue fills within a
-	// round trip, and the previous round's minimum lags behind it.
+	// Wi-Fi delay spikes last a few round trips, while a standing queue
+	// persists, so take the minimum over several.
 	recent := c.roundMinRTT
-	if recent == 0 {
-		recent = c.prevRoundMinRTT
+	for _, r := range c.roundMins {
+		if r != 0 && (recent == 0 || r < recent) {
+			recent = r
+		}
 	}
 	if c.minRTT == 0 || recent == 0 {
 		return false
@@ -159,9 +164,10 @@ func (c *cubicState) randomLoss() bool {
 	if recent-c.minRTT >= margin {
 		return false
 	}
-	// Random loss leaves isolated holes in what the receiver has, while a
-	// queue overflowing under a burst (netstack doesn't pace) drops runs of
-	// consecutive packets, even at a shallow queue that adds little delay.
+	// Random loss leaves short holes in what the receiver has (Wi-Fi loses
+	// up to a few packets at once), while a queue overflowing under a burst
+	// (netstack doesn't pace) drops long runs of consecutive packets, even
+	// at a shallow queue that adds little delay.
 	if c.s.ep.SACKPermitted && int(c.s.ep.scoreboard.LargestHole(c.s.SndUna)) > lossDiffMaxHole*c.s.MaxPayloadSize {
 		return false
 	}
@@ -171,14 +177,21 @@ func (c *cubicState) randomLoss() bool {
 	return c.recentLossRate() < lossDiffMaxLossRate
 }
 
+// The lossdiff thresholds were tuned on a link model replaying the delay and
+// loss measured on a Wi-Fi path, against shallow-buffer congestion and
+// fairness with a competing CUBIC flow.
 const (
+	// lossDiffRounds is the number of round trips, including the current
+	// one, over which the smallest RTT is compared with the minimum.
+	lossDiffRounds = 8
+
 	// lossDiffMaxLossRate is the recent retransmission rate above which
 	// losses are always treated as congestion.
-	lossDiffMaxLossRate = 0.03
+	lossDiffMaxLossRate = 0.05
 
 	// lossDiffMaxHole is the largest run of consecutive missing packets,
 	// as reported by SACK, that still counts as random loss.
-	lossDiffMaxHole = 2
+	lossDiffMaxHole = 8
 )
 
 // lossRound counts the data sent and retransmitted in one round trip.
